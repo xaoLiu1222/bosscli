@@ -1,0 +1,700 @@
+"""bosscli entry point.  Usage: bosscli {search|filters|login|whoami|detail} ... [opts]
+(or `python -m bosscli.cli ...` without installing)."""
+from __future__ import annotations
+import argparse, json, os, sys, time
+from .client import BossClient, AuthExpired
+from . import output
+
+DEFAULT_SESSION = os.environ.get("BOSS_SESSION") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "session.local.json")
+
+# common city codes (BOSS uses China weather-station codes as cityCode)
+CITY_ALIASES = {
+    "全国": "100010000", "北京": "101010100", "上海": "101020100", "广州": "101280100",
+    "深圳": "101280600", "杭州": "101210100", "成都": "101270100", "南京": "101190100",
+    "武汉": "101200100", "西安": "101110100", "苏州": "101190400", "天津": "101030100",
+    "长沙": "101250100", "重庆": "101040100", "郑州": "101180100", "厦门": "101230200",
+}
+
+# --sort names -> request value (server echoes internal codes 6/1/2; -1 = comprehensive request value)
+SORT_ALIASES = {"综合": -1, "comprehensive": -1, "最新": 1, "latest": 1, "距离": 2, "distance": 2}
+
+# convenience filter flags -> filterParams key. Values are BOSS codes (discover with `boss filters`);
+# multi-value keys take a comma-separated string. --filter-param KEY=VAL is the raw escape hatch.
+FILTER_FLAGS = {
+    "salary": "salary", "experience": "experience", "degree": "degree",
+    "scale": "scale", "stage": "stage", "jobtype": "jobType",
+    "industry": "industry", "position": "position",
+}
+
+MAX_ALL_PAGES = 10  # safety cap for --all so we never hammer the API unbounded
+
+
+def resolve_city(s: str) -> tuple[str, str]:
+    """return (label, code). accepts an alias name or a raw code."""
+    if s in CITY_ALIASES:
+        return s, CITY_ALIASES[s]
+    return s, s  # assume raw code
+
+
+def _build_filter_params(args) -> dict:
+    """Collect --filter-param KEY=VAL plus the convenience flags into one filterParams dict."""
+    fp: dict = {}
+    for item in (args.filter_param or []):
+        if "=" not in item:
+            sys.exit(f"--filter-param 需形如 KEY=VALUE，收到: {item!r}")
+        k, v = item.split("=", 1)
+        fp[k.strip()] = v.strip()
+    for flag, key in FILTER_FLAGS.items():
+        v = getattr(args, flag, None)
+        if v is not None:
+            fp[key] = v
+    return fp
+
+
+def _resolve_sort(v) -> int:
+    if v is None:
+        return -1
+    if isinstance(v, str) and v in SORT_ALIASES:
+        return SORT_ALIASES[v]
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        sys.exit(f"--sort 需为数字或 {list(SORT_ALIASES)}，收到 {v!r}")
+
+
+def _client(args) -> BossClient:
+    if not os.path.exists(args.session):
+        sys.exit(f"session file not found: {args.session}\n"
+                 f"Copy session.example.json -> session.local.json and fill in your t2 token "
+                 f"and device profile (see README), or run `boss login --phone <号码> --solve`.")
+    client = BossClient.from_file(args.session)
+    if getattr(args, "token", None):
+        client.s["t2"] = args.token
+    return client
+
+
+def _auth_hint():
+    print("[!] 登录状态已失效 (t2 过期)。用以下命令刷新后重试：", file=sys.stderr)
+    print("    boss login --phone <你的号码> --solve", file=sys.stderr)
+
+
+def cmd_search(args):
+    client = _client(args)
+    sort = _resolve_sort(args.sort)
+    filter_params = _build_filter_params(args)
+
+    cities = [resolve_city(x.strip()) for x in args.city.split(",")] if args.city else [("默认", None)]
+    # page selection: --all > --pages N > --page P (single, back-compat) > page 1
+    if args.all:
+        page_nums = list(range(1, MAX_ALL_PAGES + 1))
+    elif args.pages > 1:
+        page_nums = list(range(1, args.pages + 1))
+    else:
+        page_nums = [args.page]
+    last_page = page_nums[-1]
+    seen: set = set()
+    all_jobs: list[dict] = []
+
+    try:
+        for label, code in cities:
+            for page in page_nums:
+                resp = client.search(args.query, city=code, page=page, sort=sort,
+                                     filter_params=filter_params or None)
+                card = resp.get("zpData", {}).get("/api/zpgeek/app/geek/search/cardlist", {})
+                if resp.get("code") != 0 or card.get("code") != 0:
+                    print(f"[!] {label} p{page}: outer={resp.get('code')} {resp.get('message')} | "
+                          f"cardlist={card.get('code')} {card.get('message')}", file=sys.stderr)
+                    if resp.get("code") in (36, 37):   # 账户异常/频控 —— 降速或稍后再试
+                        print("    [i] 触发 BOSS 风控/频控，请降低频率、隔一段时间再搜。", file=sys.stderr)
+                    break
+                jobs = BossClient.parse_jobs(resp)
+                if not jobs:
+                    break
+                new = 0
+                for j in jobs:
+                    keyid = j.get("jobId") or j.get("securityId") or id(j)
+                    if keyid in seen:
+                        continue
+                    seen.add(keyid)
+                    j["_city_label"] = label
+                    all_jobs.append(j)
+                    new += 1
+                if args.limit and len(all_jobs) >= args.limit:
+                    break
+                if new == 0 and page > 1:   # page returned only dups -> end of useful results
+                    break
+                if page < last_page:
+                    time.sleep(0.5)          # be polite between pages
+            if args.limit and len(all_jobs) >= args.limit:
+                break
+    except AuthExpired:
+        _auth_hint(); sys.exit(2)
+
+    if args.filter:
+        kw = args.filter
+        def hit(j):
+            hay = (j.get("name") or "") + " " + output._labels(j.get("labels")) + " " + (j.get("company") or "")
+            return kw in hay
+        all_jobs = [j for j in all_jobs if hit(j)]
+
+    if args.limit:
+        all_jobs = all_jobs[:args.limit]
+
+    fmt = "json" if args.json else args.format
+    body = output.render(all_jobs, fmt)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8", newline="") as f:
+            f.write(body + ("\n" if not body.endswith("\n") else ""))
+        print(f"[✓] {len(all_jobs)} jobs -> {args.output} ({fmt})")
+        return
+
+    if fmt == "text":
+        flt = f" filter='{args.filter}'" if args.filter else ""
+        pg = f"pages=1..{last_page}" if last_page > 1 else "page=1"
+        print(f"# {len(all_jobs)} jobs for '{args.query}' (cities={[c[0] for c in cities]}, {pg}{flt})")
+    print(body)
+
+
+def cmd_filters(args):
+    """Probe the live search response and print the filter/sort options it advertises, so the
+    user can discover valid codes for --industry / --position / --sort (and see the NLP tags)."""
+    client = _client(args)
+    _, code = resolve_city(args.city) if args.city else ("", None)
+    try:
+        resp = client.search(args.query, city=code, page=1)
+    except AuthExpired:
+        _auth_hint(); sys.exit(2)
+    zp = BossClient.cardlist_data(resp)
+
+    print("# sorts (--sort 值)")
+    for s in zp.get("sorts") or []:
+        print(f"    {s.get('code'):>3}  {s.get('name')}")
+
+    def walk(node, depth, prefix_seen):
+        subs = node.get("subLevelModelList")
+        name = node.get("name"); val = node.get("value")
+        if val:
+            code = val.split(":", 1)[1] if ":" in val else val
+            print(f"    {'  '*depth}{code:<10} {name}   ({val})")
+        elif name:
+            print(f"    {'  '*depth}{name}")
+        for s in (subs or []):
+            walk(s, depth + 1, prefix_seen)
+
+    for cat in zp.get("nlpFilters") or []:
+        print(f"\n# {cat.get('name')}  (--industry / --position 用左侧数字码)")
+        for s in cat.get("subLevelModelList") or []:
+            walk(s, 0, set())
+
+    lf = zp.get("labelFilter") or {}
+    if lf.get("tags"):
+        print("\n# labelFilter tags")
+        for t in lf["tags"]:
+            print(f"    {t.get('code'):>8}  {t.get('tag')}  [{t.get('source','')}]")
+
+    print("\n提示：薪资/经验/学历/规模/融资的码表不在此响应里；用 `--filter-param 键=值` 原样透传，"
+          "或在 App 里对照。已知服务器认这些 filterParams 键：salary / experience / degree / "
+          "scale / stage / jobType / industry / position。")
+
+
+def _run(fn):
+    """Call an endpoint, translating AuthExpired into the standard hint/exit."""
+    try:
+        return fn()
+    except AuthExpired:
+        _auth_hint(); sys.exit(2)
+
+
+def _check_code(resp: dict, what: str):
+    if isinstance(resp, dict) and resp.get("code") not in (0, None):
+        msg = resp.get("message")
+        print(f"[!] {what}: code={resp.get('code')} {msg}", file=sys.stderr)
+        if resp.get("code") in (36, 37):
+            print("    [i] 触发 BOSS 风控/频控，请降低频率、稍后再试。", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_upload(args):
+    """Only upload an image; default is a local preview, not a remote write or chat send."""
+    from .upload import UploadError, UPLOAD_HOST, PRECHECK_PATH, UPLOAD_IMAGE_PATH, prepare_image
+    import requests
+    try:
+        image = prepare_image(args.file, original=args.original)
+        if not args.confirm:
+            preview = {"dry_run": True, "image": image.summary(), "host": UPLOAD_HOST,
+                       "precheck": not args.skip_precheck, "precheck_path": PRECHECK_PATH,
+                       "upload_path": UPLOAD_IMAGE_PATH, "sends_chat_message": False}
+            if args.json:
+                print(json.dumps(preview, ensure_ascii=False, indent=2))
+            else:
+                print(f"[dry-run] {image.filename}: {image.width}×{image.height} {image.format}, "
+                      f"{len(image.data)} bytes, MD5={image.md5}")
+                print(f"  {UPLOAD_HOST}: " + ("MD5 预检 → 上传（命中则复用 URL）"
+                      if not args.skip_precheck else "直接上传，跳过 MD5 预检"))
+                print("  需要 session.secretKey、t2 与上传上下文 securityId；本次未读取会话、未发请求。")
+                print("  加 --confirm 才上传；只返回图片地址，不会向任何人发送聊天消息。")
+            return
+        context = args.security_id
+        if args.security_id_file:
+            with open(args.security_id_file, encoding="utf-8-sig") as f:
+                context = f.read().strip()
+        client = _client(args)
+        resp = _run(lambda: client._upload_prepared(image, context, precheck=not args.skip_precheck))
+    except requests.RequestException as exc:
+        # RequestException is an OSError subclass, and InvalidHeader also subclasses ValueError.
+        # Catch it FIRST: its text may echo the t2 header or other credentials.
+        print(f"[!] 上传请求失败（{type(exc).__name__}）；未自动重试，请先核实服务器结果。", file=sys.stderr)
+        raise SystemExit(2) from None
+    except (ValueError, OSError, UploadError) as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    if args.json:
+        print(json.dumps(resp, ensure_ascii=False, indent=2))
+        return
+    data = resp["zpData"]
+    meta = resp["_upload"]
+    print(("[✓] 命中缓存，未重复上传" if meta["cached"] else "[✓] 图片上传成功")
+          + "；未发送聊天消息。")
+    for k in ("url", "tinyUrl"):
+        print(f"  {k} = {data[k]}")
+    print("  注意：返回的图片 URL 可能包含授权参数，请勿公开分享。")
+
+
+def _terminal_safe(value):
+    """Escape external text that could rewrite/spoof the recipient confirmation display."""
+    import unicodedata
+    out = []
+    for char in str(value):
+        if unicodedata.category(char) in ("Cc", "Cf", "Cs", "Zl", "Zp"):
+            point = ord(char)
+            out.append(f"\\u{point:04x}" if point <= 0xffff else f"\\U{point:08x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def cmd_outreach(args):
+    """List jobs, bind ONE selection and require one explicit confirmation before writes."""
+    from .contacts import SelectedJob
+    from .upload import prepare_image, UploadError
+    from .im_sender import ImageSender
+    from .im_mqtt import MQTTError
+    from .outreach import execute_selected, OutreachError
+    import requests
+    client = _client(args)
+    write_started = False
+    try:
+        image = prepare_image(args.image, original=args.original)
+        _, city = resolve_city(args.city) if args.city else ("默认", None)
+        response = _run(lambda: client.search(args.query, city=city))
+        _check_code(response, "search")
+        card = (response.get("zpData") or {}).get("/api/zpgeek/app/geek/search/cardlist") or {}
+        _check_code(card, "search/cardlist")
+        rows = client.parse_jobs(response)[:args.limit]
+        if not rows:
+            print("没有找到岗位；未打招呼、未上传或发送图片。")
+            return
+        for i, row in enumerate(rows, 1):
+            print(f"{i:>2}. {_terminal_safe(row.get('name') or '(未提供岗位名)')} | "
+                  f"{_terminal_safe(row.get('company') or '(未提供公司)')} | "
+                  f"{_terminal_safe(row.get('city') or '')} | {_terminal_safe(row.get('salary') or '')} | "
+                  f"{_terminal_safe(row.get('hr') or '(未提供招聘者名)')} | "
+                  f"jobId={_terminal_safe(row.get('jobId'))} userId={_terminal_safe(row.get('userId'))}")
+        selection = args.select
+        interactive = sys.stdin.isatty()
+        if selection is None:
+            if not interactive:
+                print("仅列出结果；请指定 --select 编号。--confirm 仅在选定岗位后有效。")
+                return
+            answer = input("选择一个岗位编号（回车取消）：").strip()
+            if not answer:
+                return
+            if not answer.isdecimal():
+                raise ValueError("岗位编号必须是正整数")
+            selection = int(answer)
+        if not 1 <= selection <= len(rows):
+            raise ValueError("所选岗位编号超出当前结果范围")
+        selected = SelectedJob.from_search_job(rows[selection - 1])
+        if args.expected_job_id is not None and args.expected_job_id != selected.job_id:
+            raise ValueError("所选编号对应的岗位已变化，与 --expected-job-id 不符，已停止")
+        if args.expected_user_id is not None and args.expected_user_id != selected.user_id:
+            raise ValueError("该岗位招聘者已变化，与 --expected-user-id 不符，已停止")
+        if args.confirm and (args.expected_job_id is None or args.expected_user_id is None):
+            raise ValueError("预置 --confirm 必须同时指定 --expected-job-id 和 --expected-user-id，避免误发")
+        print(f"\n待发送：{_terminal_safe(selected.name)} | {_terminal_safe(selected.company)} | "
+              f"招聘者 {_terminal_safe(selected.recipient_name or '(未提供姓名)')}")
+        print(f"  jobId={selected.job_id} userId={selected.user_id}")
+        print(f"图片：{_terminal_safe(image.filename)}，{image.width}×{image.height}，{len(image.data)} bytes")
+        print("将打招呼并在该招聘者会话发图；聊天连接可能导致手机端重连。")
+        confirmed = args.confirm
+        if not confirmed and interactive:
+            confirmed = input("确认执行以上两项操作？输入 yes 发送，其它取消：").strip().lower() == "yes"
+        if not confirmed:
+            print("未确认；未打招呼、未上传或发送图片。加 --confirm 才实际执行。")
+            return
+        sender = ImageSender(client.s)
+        journal = args.journal or os.path.join(os.path.dirname(os.path.abspath(args.session)), "outreach.local.json")
+        write_started = True
+        result = execute_selected(client, sender, selected, image, confirmed=True, journal_path=journal)
+        if result["status"] == "already_sent":
+            print("[✓] 该岗位与图片已有成功记录，本次未重复发送。")
+        else:
+            print(f"[✓] 打招呼及图片发送完成，收到业务回执 serverMid={result['server_mid']}。")
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+    except (EOFError, KeyboardInterrupt):
+        if write_started:
+            print("\n任务被中断，发送结果可能不确定；请核对本地记录，不要直接重发。", file=sys.stderr)
+            raise SystemExit(2) from None
+        print("\n已取消选择或确认；未执行打招呼、上传和发图。")
+        return
+    except AuthExpired:
+        _auth_hint()
+        print("    本次可能已执行部分步骤，请核对发送记录；不会自动重发。", file=sys.stderr)
+        raise SystemExit(2) from None
+    except requests.RequestException as exc:
+        print(f"[!] 网络请求异常（{type(exc).__name__}）；不自动重发，请核对发送记录。", file=sys.stderr)
+        raise SystemExit(2) from None
+    except (ValueError, OSError, UploadError, OutreachError, MQTTError) as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        print("    未确认结果的发送不自动重试；请查看本地记录或官方 App 后再处理。", file=sys.stderr)
+        raise SystemExit(2) from None
+    finally:
+        client.http.close()
+
+
+def cmd_whoami(args):
+    client = _client(args)
+    resp = _run(lambda: client.whoami())
+    _check_code(resp, "whoami")
+    if args.json:
+        print(json.dumps(resp, ensure_ascii=False, indent=2)); return
+    expects = BossClient.parse_expects(resp)
+    print(f"# uid={client.s.get('uid')}  求职期望 {len(expects)} 个")
+    for e in expects:
+        print(f"- [{e['kind']}] {e['positionName']} | {e['salary']} | {e['location']}  "
+              f"expectId={e['expectId']} encryptExpectId={e['encryptExpectId']}")
+    if args.set_expect and expects:
+        e = expects[0]
+        with open(args.session, encoding="utf-8") as f:
+            sess = json.load(f)
+        cd = sess.setdefault("cardlist_defaults", {})
+        cd["expectId"] = str(e["expectId"]) if e["expectId"] is not None else cd.get("expectId")
+        if e["encryptExpectId"]:
+            cd["encryptExpectId"] = e["encryptExpectId"]
+        with open(args.session, "w", encoding="utf-8") as f:
+            json.dump(sess, f, ensure_ascii=False, indent=2)
+        print(f"[✓] 已把 expectId={cd['expectId']} 写回 {args.session} 的 cardlist_defaults")
+
+
+def cmd_detail(args):
+    client = _client(args)
+    resp = _run(lambda: client.job_detail(args.security_id, lid=args.lid, expect_id=args.expect_id))
+    _check_code(resp, "detail")
+    if args.json:
+        print(json.dumps(resp, ensure_ascii=False, indent=2)); return
+    zp = resp.get("zpData", resp) or {}
+    jb = zp.get("jobBaseInfo") or {}
+    boss = zp.get("bossBaseInfo") or {}
+    brand = zp.get("brandComInfo") or {}
+    print(f"# {jb.get('jobName') or jb.get('positionName') or '(职位)'} | {jb.get('salaryDesc','')}")
+    print(f"  公司: {brand.get('brandName','')}  {brand.get('scaleName','')} {brand.get('stageName','')}")
+    print(f"  boss: {boss.get('name','')} {boss.get('title','')}")
+    loc = jb.get("locationName") or jb.get("address") or ""
+    if loc:
+        print(f"  地点: {loc}")
+    jd = jb.get("postDescription") or jb.get("jobDesc") or ""
+    if jd:
+        print("  --- JD ---")
+        print("  " + jd.replace("\n", "\n  "))
+
+
+def cmd_cities(args):
+    client = _client(args)
+    resp = _run(lambda: client.cities())
+    _check_code(resp, "cities")
+    zp = resp.get("zpData", resp) or {}
+    flat = []
+    def walk(nodes):
+        for nd in nodes or []:
+            code, name = nd.get("code"), nd.get("name")
+            if code and name:
+                flat.append((str(code), name))
+            walk(nd.get("subLevelModelList") or nd.get("subList") or nd.get("children"))
+    walk(zp.get("city") or zp.get("cityList") or [])
+    if args.json:
+        print(json.dumps(dict(flat), ensure_ascii=False, indent=2)); return
+    kw = args.grep
+    shown = 0
+    for code, name in flat:
+        if kw and kw not in name:
+            continue
+        print(f"{code}\t{name}")
+        shown += 1
+    print(f"# {shown}/{len(flat)} cities" + (f" matching '{kw}'" if kw else ""), file=sys.stderr)
+
+
+def cmd_chat(args):
+    """WRITE action — 打招呼/发起沟通. Dry-run by default; --confirm actually sends it.
+    securityId / --lid / --friend-id(=userId) come from a SEARCH result (boss search --json),
+    NOT from job detail — friend/add only accepts the search-card securityId."""
+    client = _client(args)
+    if not args.expect_id:   # default to the session's expectId (see `boss whoami --set-expect`)
+        args.expect_id = client.s.get("cardlist_defaults", {}).get("expectId")
+    payload = {"securityId": args.security_id, "jobId": args.job_id, "lid": args.lid,
+               "expectId": args.expect_id, "friendId": args.friend_id, "applyJobDirectly": 1}
+    if not args.confirm:
+        print("[dry-run] 将向 GET /api/zpgeek/app/friend/add 发起打招呼（写操作，会以你的账号发出）：")
+        print("  " + json.dumps({k: v for k, v in payload.items() if v is not None}, ensure_ascii=False))
+        print("  确认无误后加 --confirm 真正发送。")
+        if not args.friend_id:
+            print("  [i] 建议带上 --friend-id <userId>（来自 boss search --json 的 userId），否则可能 code=17。")
+        return
+    resp = _run(lambda: client.add_friend(
+        args.security_id, job_id=args.job_id, lid=args.lid, expect_id=args.expect_id,
+        friend_id=args.friend_id))
+    _check_code(resp, "chat")
+    rel = (resp.get("zpData") or {}).get("relation") or {}
+    print(f"[✓] 打招呼成功 · {resp.get('message') or 'ok'}"
+          + (f" · 已与 {rel.get('name')}（{rel.get('jobName')}）建立会话" if rel else ""))
+    if args.json:
+        print(json.dumps(resp, ensure_ascii=False, indent=2))
+
+
+def _auto_solve_captcha(lc, args):
+    """--solve: solve whatever captcha man/machine demands and populate args.validate (+
+    challenge/seccode for Geetest). Routes by captchaType:
+      4   网易易盾 -> gt3solver.netease_harvest (browser slide solve)
+      0/1 Geetest -> CapSolver token mode (handles slide AND 九宫格点选, no browser) if CAPSOLVER_KEY
+          is set, else fall back to the browser harvester (opencv slide / 超级鹰 click).
+    All solvers are imported lazily so the manual --validate path works without their deps."""
+    import json as _json
+    from .login import CAPTCHA_GEETEST, CAPTCHA_NETEASE
+    mm = lc.man_machine(args.phone)
+    if not mm["isMachine"]:
+        print("[+] man/machine: isMachine=false，无需验证码"); return
+    ct = mm.get("captchaType")
+    headless = not args.headful
+    if ct == CAPTCHA_NETEASE:
+        from gt3solver.netease_harvest import harvest
+        print("[*] 网易易盾：启动浏览器求解…（低频使用，勿密集重试）")
+        got = harvest(args.session, phone=args.phone, attempts=args.attempts, headless=headless)
+        if not (got and got.get("validate")):
+            sys.exit("[✗] 网易易盾未解出；重试，或加 --headful 用有头浏览器")
+        args.validate = got["validate"]
+        print("[✓] 网易易盾已解出 validate")
+    elif ct in CAPTCHA_GEETEST:
+        sc = _json.loads(mm["startCaptcha"]) if mm.get("startCaptcha") else {}
+        gt, chal = sc.get("gt"), sc.get("challenge")
+        # 1) prefer CapSolver token mode — one API round-trip, covers slide + 九宫格点选, no browser
+        try:
+            from gt3solver.capsolver import CapSolver, CapSolverError
+            if not (gt and chal):
+                raise CapSolverError("man/machine 未返回 gt/challenge")
+            print("[*] Geetest：CapSolver token 求解…（slide/九宫格通用）")
+            got = CapSolver().solve_geetest_v3(gt, chal)
+            if not got.get("validate"):
+                raise CapSolverError("CapSolver 未返回 validate")
+            args.challenge = got["challenge"] or chal
+            args.validate = got["validate"]
+            args.seccode = got["seccode"]
+            print("[✓] CapSolver 解出 Geetest challenge/validate/seccode")
+            return
+        except Exception as e:
+            print(f"[i] CapSolver 不可用/失败（{e}）；回退浏览器 harvester")
+        # 2) fallback: browser harvester (opencv slide, or 九宫格点选 via 超级鹰)
+        from gt3solver.browser_harvest import harvest
+        print("[*] Geetest GT3：启动浏览器求解…")
+        got = harvest(args.session, phone=args.phone, attempts=args.attempts, headless=headless)
+        if not (got and got.get("geetest_validate")):
+            sys.exit("[✗] Geetest 未解出；建议配置 CAPSOLVER_KEY，或重试/加 --headful")
+        args.challenge = got["geetest_challenge"]
+        args.validate = got["geetest_validate"]
+        args.seccode = got["geetest_seccode"]
+        print("[✓] Geetest 已解出（browser）")
+    else:
+        sys.exit(f"[✗] 未知 captchaType={ct}，无法自动求解")
+
+
+def cmd_login(args):
+    if not os.path.exists(args.session):
+        sys.exit(f"session file not found: {args.session}\n"
+                 f"login reuses the device profile (client_info/uniqid) from your session file; "
+                 f"copy session.example.json -> session.local.json and fill the device profile first.")
+    from .login import (LoginClient, LoginError, CaptchaRequired, update_session_token,
+                        CAPTCHA_GEETEST, CAPTCHA_NETEASE)
+    lc = LoginClient.from_file(args.session)
+    identity = {"geek": "0", "boss": "1"}.get(args.identity, args.identity)
+
+    # --solve: auto-solve the behavior captcha in a browser and fill args.validate before sending
+    if args.solve and not args.code and not (args.validate or args.seccode):
+        _auto_solve_captcha(lc, args)
+
+    try:
+        # --code X: code already sent, just log in.  --send: only send.  neither: full interactive.
+        if not args.code:
+            resp = lc.send_sms_code(
+                args.phone, region=args.region, voice=("1" if args.voice else "0"),
+                challenge=args.challenge, validate=args.validate, seccode=args.seccode)
+            print(f"[+] 验证码已发送到 {args.region} {args.phone}")
+            if args.send:
+                print(f"    收到后用: boss login --phone {args.phone} --code <验证码>"
+                      + (f" --region {args.region}" if args.region != '+86' else ""))
+                return
+            from .smsbackend import resolve_backend
+            args.code = resolve_backend(args.sms_backend)(args.phone)
+            if not args.code:
+                sys.exit("[✗] 未取得短信验证码（backend 返回空）")
+
+        tokens = lc.code_login(args.phone, args.code, region=args.region, identity_type=identity)
+    except CaptchaRequired as e:
+        # man/machine 对离设备请求几乎恒返回 isMachine=true —— 这是 BOSS 登录的必经步骤
+        # (真机也弹验证码，人手解掉才发码)，与出口 IP 无关。captchaType 决定该解哪种：
+        #   0/1 = Geetest GT3 (startCaptcha 带 gt/challenge) —— 解出后传 --challenge/--validate/--seccode
+        #   4   = 网易易盾   —— App 的 onValidate 只回填 validate 一个字段，故解出后只需 --validate
+        print(f"[风控拦截] {e}")
+        if e.captcha_type in CAPTCHA_GEETEST:
+            print(f"    Geetest GT3: {e.start_captcha}")
+            print("    解出后：boss login --phone <号码> --challenge <c> --validate <v> --seccode <s>")
+        elif e.captcha_type == CAPTCHA_NETEASE:
+            print(f"    网易易盾: captchaId={e.wy_captcha_id} type={e.wy_captcha_type} (0=滑块/1=无感)")
+            print("    解出后：boss login --phone <号码> --validate <网易validate>  (网易只需 validate)")
+        else:
+            print(f"    未知 captchaType={e.captcha_type}")
+        print("    注：isMachine=true 是登录常态，非 IP 封锁；需要一次真正的验证码 token。可加 --solve 自动求解。")
+        sys.exit(2)
+    except LoginError as e:
+        sys.exit(f"[登录失败] {e}")
+
+    update_session_token(args.session, tokens)
+    who = "新用户(注册)" if tokens.get("register") else "老用户"
+    print(f"[✓] 登录成功 · uid={tokens.get('uid')} · {who} · t2 已写入 {args.session}")
+    if not tokens.get("t2"):
+        print("[!] 响应里没有 t2，请检查 --json 原始响应:")
+        print(json.dumps(tokens.get("raw"), ensure_ascii=False, indent=2))
+
+
+def _add_search_filters(sp):
+    sp.add_argument("--city", help="city name(北京/上海/杭州...) or code; comma-separated for several")
+    sp.add_argument("--filter", help="post-filter: keep only jobs whose title/labels/company contain this text")
+    sp.add_argument("--page", type=int, default=1, help="(deprecated alias) start page; prefer --pages")
+    sp.add_argument("--pages", type=int, default=1, help="fetch pages 1..N (default 1)")
+    sp.add_argument("--all", action="store_true", help=f"fetch until exhausted (cap {MAX_ALL_PAGES} pages)")
+    sp.add_argument("--sort", default=None, help="综合/最新/距离 or -1/1/2 (default 综合)")
+    sp.add_argument("--limit", type=int, help="cap the number of jobs returned")
+    sp.add_argument("--filter-param", action="append", metavar="KEY=VAL",
+                    help="raw filterParams passthrough (repeatable), e.g. --filter-param salary=407")
+    for flag in FILTER_FLAGS:
+        sp.add_argument(f"--{flag}", help=f"filterParams.{FILTER_FLAGS[flag]} code (see `boss filters`)")
+    sp.add_argument("--format", choices=["text", "json", "csv", "md"], default="text", help="output format")
+    sp.add_argument("--json", action="store_true", help="shorthand for --format json")
+    sp.add_argument("-o", "--output", help="write to this file instead of stdout")
+    sp.add_argument("--token", help="override t2 auth token")
+
+
+def main(argv=None):
+    from .localenv import load_local_env
+    load_local_env()   # pull CAPSOLVER_KEY / CHAOJIYING_* / BOSS_SMS_* from a gitignored .env
+    ap = argparse.ArgumentParser(
+        prog="bosscli",
+        description="Off-device BOSS直聘 search, chat, image upload and confirmed outreach")
+    ap.add_argument("--session", default=DEFAULT_SESSION,
+                    help="session json (default: session.local.json / $BOSS_SESSION)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("search", help="search jobs by keyword")
+    sp.add_argument("query")
+    _add_search_filters(sp)
+    sp.set_defaults(func=cmd_search)
+
+    fp = sub.add_parser("filters", help="show available filter/sort codes (probes a live search)")
+    fp.add_argument("query", nargs="?", default="Python", help="probe keyword (default Python)")
+    fp.add_argument("--city", help="probe city (name or code)")
+    fp.add_argument("--token", help="override t2 auth token")
+    fp.set_defaults(func=cmd_filters)
+
+    wp = sub.add_parser("whoami", help="show the logged-in account's job expectations (expectId …)")
+    wp.add_argument("--json", action="store_true")
+    wp.add_argument("--set-expect", action="store_true",
+                    help="write the first expect's expectId/encryptExpectId back into the session")
+    wp.add_argument("--token", help="override t2 auth token")
+    wp.set_defaults(func=cmd_whoami)
+
+    dp = sub.add_parser("detail", help="show a job's detail (JD, boss, company) by securityId")
+    dp.add_argument("security_id", help="securityId from a search result")
+    dp.add_argument("--lid")
+    dp.add_argument("--expect-id")
+    dp.add_argument("--json", action="store_true")
+    dp.add_argument("--token", help="override t2 auth token")
+    dp.set_defaults(func=cmd_detail)
+
+    cp = sub.add_parser("cities", help="dump BOSS city code/name table (from /api/zpCommon/config/city)")
+    cp.add_argument("--grep", help="only show cities whose name contains this text")
+    cp.add_argument("--json", action="store_true")
+    cp.add_argument("--token", help="override t2 auth token")
+    cp.set_defaults(func=cmd_cities)
+
+    hp = sub.add_parser("chat", help="打招呼/start a chat with a boss (WRITE; dry-run unless --confirm)")
+    hp.add_argument("security_id", help="securityId from a SEARCH result (boss search --json), not detail")
+    hp.add_argument("--friend-id", help="the boss's numeric userId (search result's 'userId')")
+    hp.add_argument("--job-id")
+    hp.add_argument("--lid", help="lid from the same search result")
+    hp.add_argument("--expect-id", help="your expectId (see boss whoami); default from the session")
+    hp.add_argument("--confirm", action="store_true", help="actually send it (default is dry-run)")
+    hp.add_argument("--json", action="store_true")
+    hp.add_argument("--token", help="override t2 auth token")
+    hp.set_defaults(func=cmd_chat)
+
+    up = sub.add_parser("upload", help="upload an image and return URLs; never send chat (dry-run by default)")
+    up.add_argument("file", help="local single-frame JPEG/PNG/WebP image")
+    context = up.add_mutually_exclusive_group()
+    context.add_argument("--security-id", help="upload/chat-context securityId; not a search-card id")
+    context.add_argument("--security-id-file", help="UTF-8 text file containing the upload-context securityId")
+    up.add_argument("--skip-precheck", action="store_true", help="skip the default MD5 cache precheck")
+    up.add_argument("--original", action="store_true", help="keep original bytes (including EXIF); default: upright RGB JPEG")
+    up.add_argument("--confirm", action="store_true", help="actually upload (default: offline preview only)")
+    up.add_argument("--json", action="store_true", help="JSON preview/result; URLs may carry credentials")
+    up.add_argument("--token", help="override t2 auth token (secretKey still required in session)")
+    up.set_defaults(func=cmd_upload)
+
+    op = sub.add_parser("outreach", help="search -> select ONE job -> confirm greeting and image (pure Python)")
+    op.add_argument("query", help="keyword for job search")
+    op.add_argument("--image", required=True, help="image to send in the selected recruiter's conversation")
+    op.add_argument("--city", help="city name or code")
+    op.add_argument("--select", type=int, help="1-based index in the listed results; no automatic first-job choice")
+    op.add_argument("--expected-job-id", type=int, help="pin the approved numeric jobId; required with --confirm")
+    op.add_argument("--expected-user-id", type=int, help="pin the approved recruiter userId; required with --confirm")
+    op.add_argument("--limit", type=int, choices=range(1, 31), default=10, metavar="1..30")
+    op.add_argument("--confirm", action="store_true", help="explicitly confirm greeting and image for selected job")
+    op.add_argument("--original", action="store_true", help="keep original image bytes")
+    op.add_argument("--journal", help="local dedup/uncertain-delivery journal (default beside session)")
+    op.add_argument("--json", action="store_true", help="also print final safe result as JSON")
+    op.set_defaults(func=cmd_outreach)
+
+    lp = sub.add_parser("login", help="SMS-code login -> obtain t2 into the session file")
+    lp.add_argument("--phone", required=True, help="mobile number (without region code)")
+    lp.add_argument("--region", default="+86", help="region code, e.g. +86 / +63 (default +86)")
+    lp.add_argument("--code", help="the SMS code (skip sending; just exchange code->t2)")
+    lp.add_argument("--send", action="store_true", help="only send the SMS code, then exit (two-step flow)")
+    lp.add_argument("--identity", default="geek", help="geek|boss (or 0|1); default geek")
+    lp.add_argument("--voice", action="store_true", help="request a voice call code instead of SMS")
+    lp.add_argument("--challenge", help="solved Geetest geetest_challenge (to pass man/machine)")
+    lp.add_argument("--validate", help="solved captcha validate (Geetest geetest_validate, or 网易易盾 validate)")
+    lp.add_argument("--seccode", help="solved Geetest geetest_seccode")
+    lp.add_argument("--solve", action="store_true",
+                    help="auto-solve the man/machine captcha (网易易盾/Geetest); needs the captcha extras")
+    lp.add_argument("--headful", action="store_true", help="show the browser while --solve (default headless)")
+    lp.add_argument("--attempts", type=int, default=3, help="--solve captcha attempts (default 3)")
+    lp.add_argument("--sms-backend", default=None,
+                    help="where the SMS code comes from: manual(default)|env|http|module:func "
+                         "(see bosscli/smsbackend.py; also $BOSS_SMS_BACKEND)")
+    lp.set_defaults(func=cmd_login)
+
+    args = ap.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

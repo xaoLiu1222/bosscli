@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Gradle / unidbg oracle
+signer-unidbg/.gradle/
+signer-unidbg/build/
+signer-unidbg/run_verbose*.log
+
+# secrets: session.local.json holds your t2 auth token + device profile
+session.local.json
+# upload/chat context token (keep outside Git, like the session)
+upload-security-id.txt
+upload-security-id.local.txt
+# local receiver/message delivery journal (contains account/job linkage)
+outreach.local.json
+outreach.local.json.lock
+# secrets: .env holds CAPSOLVER_KEY / CHAOJIYING_* / BOSS_SMS_* — loaded by bosscli.localenv
+.env
+
+# large binaries / samples (not committed; see README for how to obtain)
+*.so
+*.apk
+*.der
+signer-unidbg/yzwg/
+secrets/
+captures/*.raw
+
+# editor
+.idea/
+.vscode/
+
+# research scaffolding — not shipped in the public tool repo (kept locally)
+signer-unidbg/
+frida/
