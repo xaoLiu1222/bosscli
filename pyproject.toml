@@ -27,6 +27,8 @@ captcha = [
     "numpy>=1.26",
     "pycryptodome>=3.20",
 ]
+# local development (CI runs exactly this)
+dev = ["pytest>=7"]
 
 [project.scripts]
 bosscli = "bosscli.cli:main"
@@ -36,9 +38,9 @@ boss = "bosscli.cli:main"
 boss-mcp = "bosscli.mcp_server:main"
 
 [project.urls]
-Homepage = "https://github.com/1013503897/bosscli"
-Repository = "https://github.com/1013503897/bosscli"
-Issues = "https://github.com/1013503897/bosscli/issues"
+Homepage = "https://github.com/xaoLiu1222/bosscli"
+Repository = "https://github.com/xaoLiu1222/bosscli"
+Issues = "https://github.com/xaoLiu1222/bosscli/issues"
 
 [tool.setuptools]
 packages = ["bosscli", "gt3solver"]

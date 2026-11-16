@@ -1,5 +1,11 @@
 # bosscli
 
+[![CI](https://github.com/xaoLiu1222/bosscli/actions/workflows/ci.yml/badge.svg)](https://github.com/xaoLiu1222/bosscli/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-658%20passing-brightgreen)](tests)
+[![Status: research](https://img.shields.io/badge/status-research%2Feducational-orange)](#disclaimer)
+
 **English** | [中文](#中文)
 
 Search **BOSS直聘 (com.hpbr.bosszhipin)** jobs from your terminal or from an AI agent — off-device,
@@ -21,6 +27,8 @@ Or drive it from an AI agent (the MCP server) — e.g. *"find nationwide part-ti
 reverse-engineering jobs"*, rendered straight into a table (company names redacted):
 
 ![searching nationwide part-time reverse-engineering jobs through an AI agent](docs/agent-search-demo.png)
+
+## Disclaimer
 
 > Research / educational project. It searches with **your own logged-in account's token**; you are
 > responsible for complying with BOSS直聘's Terms of Service. Don't hammer the API.
